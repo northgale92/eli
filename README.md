@@ -1,7 +1,7 @@
 [README (1).md](https://github.com/user-attachments/files/30470350/README.1.md)
 # ELI — Essential Life Intelligence
 
-**Una app de mensajería y red social privada, P2P y descentralizada — para quien decide dejar WhatsApp sin renunciar a nada.**
+
 
 *A private, P2P, decentralized messaging and social app — for anyone leaving WhatsApp without giving anything up.*
 
