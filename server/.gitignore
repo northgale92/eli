@@ -1,0 +1,10 @@
+node_modules/
+dist/
+
+# El archivo .env real NUNCA va a control de versiones. Solo .env.example.
+.env
+
+# Archivos de base de datos SQLite (incluidos WAL y SHM de modo WAL)
+data/*.db
+data/*.db-shm
+data/*.db-wal
