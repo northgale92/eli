@@ -29,10 +29,9 @@ The opt-in contact-matching feature never uploads a phone number in plain text �
 ### 7. Git history of the original working repository is not public
 The original development repository's commit history contains the real name and email of the developer in every commit since the project began. This new public repository was started from a single clean commit specifically to avoid publishing that history. If you ever come across a fork or mirror claiming to be "the real ELI history," treat it with suspicion — it did not come from this project's maintainers.
 
-8. Anonymity of the creator is operational security, not a guarantee
+## 8. Anonymity of the creator is operational security, not a guarantee
 
 The project's creator (pseudonym: Prometheus) uses Tor/VPN for anonymous accounts, but acknowledges openly that account creation for some services happened without Tor/VPN in isolated instances, and that payment methods for infrastructure carry inherent traceability risk if a formal legal request were ever made to the payment provider. This isn't hidden — it's acknowledged as the weakest link in the anonymity chain.
-
 ## What's explicitly NOT a vulnerability report
 
 - "The moderation isn't perfect" — acknowledged above, not new information.
@@ -72,10 +71,9 @@ La función opcional de emparejamiento por agenda nunca sube un número de telé
 ### 7. El historial de git del repositorio de trabajo original no es público
 El historial de commits del repositorio de desarrollo original contiene el nombre y correo reales del desarrollador en cada commit desde el inicio del proyecto. Este repositorio público nuevo se inició desde un único commit limpio precisamente para evitar publicar ese historial. Si alguna vez te encuentras con un fork o espejo que afirme ser "el verdadero historial de ELI", trátalo con sospecha — no proviene de los mantenedores de este proyecto.
 
-8. El anonimato del creador es seguridad operativa, no una garantía
+## 8. El anonimato del creador es seguridad operativa, no una garantía
 
 El creador del proyecto (seudónimo: Prometheus) usa Tor/VPN para las cuentas anónimas, pero reconoce abiertamente que la creación de cuentas para algunos servicios ocurrió sin Tor/VPN en instancias aisladas, y que los métodos de pago de la infraestructura conllevan un riesgo de trazabilidad inherente si alguna vez se hiciera una solicitud legal formal al proveedor de pago. Esto no está oculto — se reconoce como el eslabón más débil de la cadena de anonimato.
-
 ## Qué NO es un reporte de vulnerabilidad
 
 - "La moderación no es perfecta" — ya reconocido arriba, no es información nueva.
