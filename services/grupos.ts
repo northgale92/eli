@@ -23,7 +23,7 @@ import { nodoGrupos, nodoGrupoMensajes, leerClavePublica } from './gun';
 //     destinatario del mismo NaCl box por mensaje.
 // ══════════════════════════════════════════════════════════════════════════════
 
-import type { TipoMensaje } from './chat';
+import { LIMITE_ELIMINAR_PARA_TODOS_MS, type TipoMensaje } from './chat';
 
 export interface Grupo {
   id: string;
@@ -43,6 +43,7 @@ export interface MensajeGrupo {
   mio: boolean;
   tipo?: TipoMensaje;
   reenviado?: boolean;
+  eliminadoParaTodos?: boolean; // tombstoned vía Gun — ver eliminarMensajeGrupoParaTodos
   // tipo === 'audio'
   audioBase64?: string;
   duracionMs?: number;
@@ -131,7 +132,77 @@ async function guardarMensajesGrupoLocal(grupoId: string, mensajes: MensajeGrupo
 
 export async function cargarMensajesGrupoLocal(grupoId: string): Promise<MensajeGrupo[]> {
   const raw = await AsyncStorage.getItem(keyMensajesGrupo(grupoId));
-  return raw ? JSON.parse(raw) : [];
+  const mensajes: MensajeGrupo[] = raw ? JSON.parse(raw) : [];
+  // Orden por `hora` (timestamp de envío original), no por orden de llegada:
+  // en un grupo, cada mensaje llega vía nodo.map().on() de Gun en el orden en
+  // que el P2P/relay lo sincroniza, que no coincide con el orden de envío —
+  // sobre todo con reenvíos, donde varios mensajes salen casi a la vez.
+  return mensajes.sort((a, b) => a.hora - b.hora);
+}
+
+// Borra un único mensaje solo de este dispositivo — mismo alcance "local"
+// que borrarGrupoLocal (que borra el grupo entero) y que borrarMensaje en
+// services/chat.ts para 1:1 (mismo patrón: no notifica ni tombstona en Gun,
+// solo actualiza el resumen si el mensaje borrado era el último).
+export async function borrarMensajeGrupo(grupoId: string, mensajeId: string): Promise<void> {
+  const mensajes = await cargarMensajesGrupoLocal(grupoId);
+  const filtrados = mensajes.filter(m => m.id !== mensajeId);
+  await guardarMensajesGrupoLocal(grupoId, filtrados);
+
+  const lista = await cargarGruposLocal();
+  const idx = lista.findIndex(g => g.id === grupoId);
+  if (idx >= 0) {
+    const ultimo = filtrados[filtrados.length - 1];
+    lista[idx].ultimoMensaje = ultimo?.texto ?? '';
+    if (ultimo) lista[idx].ultimaHora = ultimo.hora;
+    await guardarGruposLocal(lista);
+  }
+}
+
+// Reduce un mensaje de grupo a su forma "eliminado para todos" — mismo
+// criterio que tombstonarMensaje en services/chat.ts: solo quedan los
+// metadatos imprescindibles, nada de texto/adjuntos.
+function tombstonarMensajeGrupo(m: MensajeGrupo): MensajeGrupo {
+  return { id: m.id, de: m.de, hora: m.hora, mio: m.mio, tipo: 'texto', texto: '', eliminadoParaTodos: true };
+}
+
+// "Eliminar para todos" en grupo — mismo patrón que eliminarMensajeParaTodos
+// en services/chat.ts: tombstona (put null) el nodo del mensaje en Gun para
+// que la eliminación llegue a cada miembro por la sincronización normal.
+export async function eliminarMensajeGrupoParaTodos(
+  grupoId: string,
+  mensajeId: string,
+  miId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const mensajes = await cargarMensajesGrupoLocal(grupoId);
+  const idx = mensajes.findIndex(m => m.id === mensajeId);
+  if (idx < 0) return { ok: false, error: 'Mensaje no encontrado.' };
+  if (mensajes[idx].de !== miId) {
+    return { ok: false, error: 'Solo puedes eliminar para todos tus propios mensajes.' };
+  }
+  if (Date.now() - mensajes[idx].hora > LIMITE_ELIMINAR_PARA_TODOS_MS) {
+    return { ok: false, error: 'Ya pasó el tiempo disponible para eliminar este mensaje para todos.' };
+  }
+
+  try {
+    nodoGrupoMensajes(grupoId)?.get(mensajeId).put(null);
+  } catch {
+    // Sin red — mismo best-effort que eliminarMensajeParaTodos en chat.ts.
+  }
+
+  mensajes[idx] = tombstonarMensajeGrupo(mensajes[idx]);
+  await guardarMensajesGrupoLocal(grupoId, mensajes);
+
+  const ultimo = mensajes[mensajes.length - 1];
+  if (ultimo) {
+    await actualizarGrupoResumen(
+      grupoId,
+      ultimo.eliminadoParaTodos ? 'Este mensaje fue eliminado' : ultimo.texto,
+      ultimo.hora,
+    );
+  }
+
+  return { ok: true };
 }
 
 // ─── Creación y descubrimiento ─────────────────────────────────────────────────
@@ -386,6 +457,36 @@ function interpretarPayloadGrupo(payloadRaw: string): Partial<MensajeGrupo> & { 
   }
 }
 
+// Aplica un tombstone recibido en un mensaje de grupo (nodo puesto a null vía
+// eliminarMensajeGrupoParaTodos) — mismo criterio que procesarTombstoneMensaje
+// en services/chat.ts: reemplaza el mensaje conocido localmente por su
+// versión "eliminado" en vez de dejarlo desaparecer sin rastro. Idempotente.
+async function procesarTombstoneMensajeGrupo(
+  grupoId: string,
+  mensajeId: string,
+  onMensaje: (msg: MensajeGrupo) => void,
+): Promise<void> {
+  if (!mensajeId) return;
+  const mensajes = await cargarMensajesGrupoLocal(grupoId);
+  const idx = mensajes.findIndex(m => m.id === mensajeId);
+  if (idx < 0 || mensajes[idx].eliminadoParaTodos) return;
+
+  const tombstoneado = tombstonarMensajeGrupo(mensajes[idx]);
+  mensajes[idx] = tombstoneado;
+  await guardarMensajesGrupoLocal(grupoId, mensajes);
+
+  const ultimo = mensajes[mensajes.length - 1];
+  if (ultimo) {
+    await actualizarGrupoResumen(
+      grupoId,
+      ultimo.eliminadoParaTodos ? 'Este mensaje fue eliminado' : ultimo.texto,
+      ultimo.hora,
+    );
+  }
+
+  onMensaje(tombstoneado);
+}
+
 export function suscribirMensajesGrupo(
   grupoId: string,
   miId: string,
@@ -394,8 +495,12 @@ export function suscribirMensajesGrupo(
 ): () => void {
   const nodo = nodoGrupoMensajes(grupoId);
 
-  nodo.map().on(async (data: any) => {
-    if (!data || !data.id || data.de === miId) return;
+  nodo.map().on(async (data: any, idNodo: string) => {
+    if (!data) {
+      await procesarTombstoneMensajeGrupo(grupoId, idNodo, onMensaje);
+      return;
+    }
+    if (!data.id || data.de === miId) return;
     const sobre = data[`para_${miId}`];
     if (!sobre) return;
 

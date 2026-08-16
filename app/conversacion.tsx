@@ -12,6 +12,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
 import * as VideoThumbnails from 'expo-video-thumbnails';
+import { Video as VideoCompressor } from 'react-native-compressor';
 import * as Sharing from 'expo-sharing';
 import EmojiPicker, { type EmojiType } from 'rn-emoji-keyboard';
 import {
@@ -23,21 +24,24 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   cargarMensajesLocal, enviarMensaje, suscribirMensajes,
   suscribirEstados, marcarLeidos, borrarMensaje, editarMensaje,
+  eliminarMensajeParaTodos, LIMITE_ELIMINAR_PARA_TODOS_MS,
   enviarMensajeAudio, enviarUbicacion,
   enviarImagen, enviarVideo, enviarDocumento,
   LIMITE_IMAGEN_LADO_PX, LIMITE_VIDEO_DURACION_S, LIMITE_VIDEO_BYTES, LIMITE_DOCUMENTO_BYTES,
+  LIMITE_VIDEO_LADO_PX, BITRATE_VIDEO_BPS,
   reaccionarMensaje, suscribirReacciones,
   notificarEscribiendo, suscribirEscribiendo,
   type Mensaje, type EstadoMensaje, type RespuestaCitada,
 } from '../services/chat';
 import { obtenerIdentidad } from '../services/identidad';
-import { idCanal, publicarClavePublica, leerPerfil } from '../services/gun';
+import { idCanal, publicarClavePublica, suscribirPerfil } from '../services/gun';
 import { Avatar } from '../components/Avatar';
 
 const ICONOS_ESTADO: Record<EstadoMensaje, string> = {
   enviado: '✓',
   entregado: '✓✓',
   leido: '✓✓',
+  error: '⚠',
 };
 
 const EMOJIS_RAPIDOS = ['❤️', '😂', '👍', '😮', '😢', '🙏'];
@@ -59,9 +63,21 @@ export default function Conversacion() {
   const [respondiendoA, setRespondiendoA] = useState<RespuestaCitada | null>(null);
   const [editandoId, setEditandoId] = useState<string | null>(null);
   const [reaccionandoA, setReaccionandoA] = useState<Mensaje | null>(null);
+  // Menú de opciones al mantener pulsado un mensaje (Responder/Reaccionar/
+  // Reenviar/Eliminar). Es un Modal propio, NO Alert.alert: Alert.alert en
+  // Android solo renderiza los 3 primeros botones del array que se le pase
+  // (ver node_modules/react-native/Libraries/Alert/Alert.js, `buttons.slice(0, 3)`)
+  // — con 4 opciones, "Eliminar" quedaba descartado en silencio sin ningún
+  // error ni warning visible. No es una regresión de wiring: borrarMensaje()
+  // en services/chat.ts y confirmarBorrarMensaje() de abajo siempre
+  // estuvieron completos y correctamente conectados.
+  const [menuMensaje, setMenuMensaje] = useState<Mensaje | null>(null);
   const [grabando, setGrabando] = useState(false);
   const [reproduciendoId, setReproduciendoId] = useState<string | null>(null);
   const [adjuntando, setAdjuntando] = useState(false);
+  // Solo se usa mientras se comprime un vídeo (VideoCompressor.compress puede
+  // tardar varios segundos); null el resto del tiempo, incl. imagen/documento.
+  const [progresoCompresion, setProgresoCompresion] = useState<number | null>(null);
   const [videoActivoId, setVideoActivoId] = useState<string | null>(null);
   const [abriendoDocId, setAbriendoDocId] = useState<string | null>(null);
   const [emojiPickerAbierto, setEmojiPickerAbierto] = useState(false);
@@ -146,16 +162,19 @@ export default function Conversacion() {
     };
   }, [destinatario]);
 
-  // Perfil (nombre visible + foto) del destinatario, para el avatar del header
+  // Perfil (nombre visible + foto) del destinatario, para el avatar del
+  // header — suscripción en vivo, no una lectura única: justo tras reiniciar
+  // la app, una lectura .once() puede resolver antes de que la conexión al
+  // relay esté lista y quedarse con el perfil vacío/desactualizado para
+  // siempre, ya que este efecto no volvía a consultar. Ver suscribirPerfil
+  // en services/gun.ts.
   useEffect(() => {
     if (!destinatario) return;
-    let cancelado = false;
-    leerPerfil(destinatario).then(perfil => {
-      if (!cancelado && perfil) {
-        setPerfilDestinatario({ nombreVisible: perfil.nombreVisible, fotoPerfil: perfil.fotoPerfil });
-      }
+    setPerfilDestinatario({});
+    const cancelar = suscribirPerfil(destinatario, (perfil) => {
+      setPerfilDestinatario({ nombreVisible: perfil.nombreVisible, fotoPerfil: perfil.fotoPerfil });
     });
-    return () => { cancelado = true; };
+    return cancelar;
   }, [destinatario]);
 
   // Scroll al último mensaje
@@ -338,11 +357,16 @@ export default function Conversacion() {
       manipulada.base64, 'image/jpeg', manipulada.width, manipulada.height, tamanoBytes,
       id.usuario, id.clavePublica, id.clavePrivada, destinatario,
     );
-    if (resultado.ok) {
+    // Se muestra la burbuja tanto en éxito como en fallo confirmado
+    // (resultado.persistido): el estado ('enviado' | 'error') refleja si la
+    // escritura en Gun se confirmó de verdad (ver enviarAdjunto en
+    // services/chat.ts). Si no se persistió nada (p. ej. sin clave pública
+    // del destinatario), no hay burbuja que mostrar.
+    if (resultado.persistido) {
       setMensajes(prev => [...prev, {
         id: `local_img_${Date.now()}`, texto: '📷 Foto',
         de: id.usuario, para: destinatario, hora: Date.now(),
-        estado: 'enviado', mio: true, tipo: 'imagen',
+        estado: resultado.ok ? 'enviado' : 'error', mio: true, tipo: 'imagen',
         archivoBase64: manipulada.base64, archivoMime: 'image/jpeg',
         ancho: manipulada.width, alto: manipulada.height, archivoTamano: tamanoBytes,
       }]);
@@ -353,11 +377,35 @@ export default function Conversacion() {
     const id = await obtenerIdentidad();
     if (!id || !destinatario) return;
 
-    const archivo = new File(asset.uri);
+    // Recodifica antes de enviar: sin esto, un vídeo de móvil típico (1080p+,
+    // varios Mbps) casi siempre supera lo que este relay P2P sin CDN puede
+    // mover de forma fiable (ver el análisis de overhead real, doble base64 +
+    // cifrado, en LIMITE_VIDEO_BYTES de services/chat.ts). Si la compresión
+    // falla (códec raro, formato no soportado), se sigue con el archivo
+    // original — mejor intentar enviarlo sin comprimir que no enviarlo.
+    let uriFinal = asset.uri;
+    setProgresoCompresion(0);
+    try {
+      uriFinal = await VideoCompressor.compress(
+        asset.uri,
+        { compressionMethod: 'manual', maxSize: LIMITE_VIDEO_LADO_PX, bitrate: BITRATE_VIDEO_BPS },
+        // El nativo emite el progreso ya en escala 0-100 (ver
+        // Compressor.kt: `presentationTimeUs / duration * 100`), no una
+        // fracción 0-1 — sin este ajuste se mostraría hasta "10000%".
+        (progreso) => setProgresoCompresion(Math.min(100, Math.round(progreso))),
+      );
+    } catch {
+      // Se sigue con asset.uri (sin comprimir); el chequeo de tamaño de
+      // abajo sigue aplicando igual.
+    } finally {
+      setProgresoCompresion(null);
+    }
+
+    const archivo = new File(uriFinal);
     if (archivo.size > LIMITE_VIDEO_BYTES) {
       Alert.alert(
         'Vídeo demasiado grande',
-        `El vídeo pesa ${(archivo.size / (1024 * 1024)).toFixed(1)} MB. El límite por P2P es ${LIMITE_VIDEO_BYTES / (1024 * 1024)} MB.`,
+        `Incluso comprimido, el vídeo pesa ${(archivo.size / (1024 * 1024)).toFixed(1)} MB. El límite por P2P es ${LIMITE_VIDEO_BYTES / (1024 * 1024)} MB.`,
       );
       return;
     }
@@ -380,11 +428,11 @@ export default function Conversacion() {
       Math.round((asset.duration ?? 0)), asset.width, asset.height, archivo.size,
       id.usuario, id.clavePublica, id.clavePrivada, destinatario,
     );
-    if (resultado.ok) {
+    if (resultado.persistido) {
       setMensajes(prev => [...prev, {
         id: `local_vid_${Date.now()}`, texto: '🎥 Vídeo',
         de: id.usuario, para: destinatario, hora: Date.now(),
-        estado: 'enviado', mio: true, tipo: 'video',
+        estado: resultado.ok ? 'enviado' : 'error', mio: true, tipo: 'video',
         archivoBase64: base64, archivoMime: asset.mimeType ?? 'video/mp4', miniaturaBase64,
         duracionMs: Math.round((asset.duration ?? 0)), ancho: asset.width, alto: asset.height,
         archivoTamano: archivo.size,
@@ -460,11 +508,11 @@ export default function Conversacion() {
         base64, asset.name, mime, tamano,
         id.usuario, id.clavePublica, id.clavePrivada, destinatario,
       );
-      if (resultadoEnvio.ok) {
+      if (resultadoEnvio.persistido) {
         setMensajes(prev => [...prev, {
           id: `local_doc_${Date.now()}`, texto: `📄 ${asset.name}`,
           de: id.usuario, para: destinatario, hora: Date.now(),
-          estado: 'enviado', mio: true, tipo: 'documento',
+          estado: resultadoEnvio.ok ? 'enviado' : 'error', mio: true, tipo: 'documento',
           archivoBase64: base64, archivoMime: mime, archivoNombre: asset.name, archivoTamano: tamano,
         }]);
       }
@@ -560,21 +608,41 @@ export default function Conversacion() {
     );
   };
 
+  // "Eliminar para todos": tombstona el mensaje en Gun (ver
+  // eliminarMensajeParaTodos en services/chat.ts) para que la eliminación se
+  // propague al otro dispositivo por la sincronización normal. A diferencia
+  // de confirmarBorrarMensaje (arriba), aquí SÍ hace falta reflejar el
+  // resultado como una burbuja "eliminado", no quitar el mensaje de la lista.
+  const confirmarEliminarParaTodos = (item: Mensaje) => {
+    if (!miId || !destinatario) return;
+    Alert.alert(
+      'Eliminar para todos',
+      'Se eliminará este mensaje para ti y para la otra persona.',
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Eliminar para todos',
+          style: 'destructive',
+          onPress: async () => {
+            const ch = idCanal(miId, destinatario);
+            const resultado = await eliminarMensajeParaTodos(ch, item.id, miId);
+            if (resultado.ok) {
+              setMensajes(prev => prev.map(m => (m.id === item.id ? {
+                id: m.id, de: m.de, para: m.para, hora: m.hora, estado: m.estado, mio: m.mio,
+                tipo: 'texto', texto: '', eliminadoParaTodos: true,
+              } : m)));
+            } else {
+              Alert.alert('No se pudo eliminar', resultado.error ?? 'Ocurrió un problema al eliminar el mensaje.');
+            }
+          },
+        },
+      ],
+    );
+  };
+
   const abrirMenuMensaje = (item: Mensaje) => {
     if (!miId || !destinatario) return;
-    const canal = idCanal(miId, destinatario);
-    Alert.alert(item.de, item.texto.length > 60 ? `${item.texto.slice(0, 60)}…` : item.texto, [
-      { text: 'Responder', onPress: () => { setEditandoId(null); setRespondiendoA({ id: item.id, texto: item.texto, de: item.de }); } },
-      { text: 'Reaccionar', onPress: () => setReaccionandoA(item) },
-      {
-        text: 'Reenviar',
-        onPress: () => router.push({
-          pathname: '/reenviar',
-          params: { mensajeId: item.id, canalOrigen: canal },
-        }),
-      },
-      { text: 'Eliminar', style: 'destructive', onPress: () => confirmarBorrarMensaje(item) },
-    ]);
+    setMenuMensaje(item);
   };
 
   const manejarTapMensaje = (item: Mensaje) => {
@@ -693,7 +761,24 @@ export default function Conversacion() {
     }
   }, [texto, enviando, miId, destinatario, editandoId, respondiendoA]);
 
-  const renderMensaje = ({ item }: { item: Mensaje }) => (
+  const renderMensaje = ({ item }: { item: Mensaje }) => {
+    // Mensaje tombstonado vía "Eliminar para todos" (ver eliminarMensajeParaTodos):
+    // se muestra como una burbuja de aviso, sin acciones (nada que responder,
+    // reaccionar, reenviar o volver a eliminar), en vez de desaparecer sin
+    // rastro o dejar un hueco vacío en la conversación.
+    if (item.eliminadoParaTodos) {
+      return (
+        <View style={[styles.burbuja, item.mio ? styles.burbujaPropia : styles.burbujaAjena]}>
+          <Text style={[styles.burbujaTexto, styles.textoEliminado, item.mio ? styles.textoPropio : styles.textoAjeno]}>
+            🚫 Este mensaje fue eliminado
+          </Text>
+          <View style={styles.burbujaMetadata}>
+            <Text style={styles.burbujaHora}>{formatoHora(item.hora)}</Text>
+          </View>
+        </View>
+      );
+    }
+    return (
     <TouchableOpacity
       activeOpacity={0.85}
       onPress={() => manejarTapMensaje(item)}
@@ -804,7 +889,11 @@ export default function Conversacion() {
         {item.editado && <Text style={styles.editadoTexto}>editado</Text>}
         <Text style={styles.burbujaHora}>{formatoHora(item.hora)}</Text>
         {item.mio && (
-          <Text style={[styles.estadoIcono, item.estado === 'leido' && styles.estadoLeido]}>
+          <Text style={[
+            styles.estadoIcono,
+            item.estado === 'leido' && styles.estadoLeido,
+            item.estado === 'error' && styles.estadoError,
+          ]}>
             {ICONOS_ESTADO[item.estado]}
           </Text>
         )}
@@ -828,7 +917,8 @@ export default function Conversacion() {
         </View>
       )}
     </TouchableOpacity>
-  );
+    );
+  };
 
   return (
     <KeyboardAvoidingView
@@ -942,12 +1032,17 @@ export default function Conversacion() {
         </TouchableOpacity>
         <TouchableOpacity
           style={styles.botonUbicacion}
-          accessibilityLabel={adjuntando ? 'Adjuntando…' : 'Adjuntar imagen, vídeo o documento'}
+          accessibilityLabel={
+            progresoCompresion !== null ? `Comprimiendo vídeo, ${progresoCompresion}%`
+              : adjuntando ? 'Adjuntando…' : 'Adjuntar imagen, vídeo o documento'
+          }
           accessibilityRole="button"
           onPress={abrirSelectorAdjunto}
           disabled={adjuntando}
         >
-          <Text style={styles.botonMicTexto}>{adjuntando ? '⏳' : '📎'}</Text>
+          <Text style={[styles.botonMicTexto, progresoCompresion !== null && styles.botonMicTextoProgreso]}>
+            {progresoCompresion !== null ? `${progresoCompresion}%` : adjuntando ? '⏳' : '📎'}
+          </Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={styles.botonUbicacion}
@@ -976,6 +1071,91 @@ export default function Conversacion() {
           <Text style={styles.botonEnviarTexto}>{enviando ? '…' : editandoId ? 'Guardar' : 'Enviar'}</Text>
         </TouchableOpacity>
       </View>
+
+      <Modal
+        visible={!!menuMensaje}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setMenuMensaje(null)}
+      >
+        <TouchableOpacity
+          style={styles.modalFondo}
+          activeOpacity={1}
+          onPress={() => setMenuMensaje(null)}
+        >
+          <TouchableOpacity activeOpacity={1} style={styles.menuMensajeCard}>
+            {!!menuMensaje && (
+              <Text style={styles.menuMensajePreview} numberOfLines={2}>
+                {menuMensaje.texto.length > 60 ? `${menuMensaje.texto.slice(0, 60)}…` : menuMensaje.texto}
+              </Text>
+            )}
+            <TouchableOpacity
+              style={styles.menuMensajeOpcion}
+              accessibilityRole="button"
+              onPress={() => {
+                if (!menuMensaje) return;
+                setEditandoId(null);
+                setRespondiendoA({ id: menuMensaje.id, texto: menuMensaje.texto, de: menuMensaje.de });
+                setMenuMensaje(null);
+              }}
+            >
+              <Text style={styles.menuMensajeOpcionTexto}>Responder</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.menuMensajeOpcion}
+              accessibilityRole="button"
+              onPress={() => {
+                if (!menuMensaje) return;
+                setReaccionandoA(menuMensaje);
+                setMenuMensaje(null);
+              }}
+            >
+              <Text style={styles.menuMensajeOpcionTexto}>Reaccionar</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.menuMensajeOpcion}
+              accessibilityRole="button"
+              onPress={() => {
+                if (!menuMensaje || !miId || !destinatario) return;
+                const canal = idCanal(miId, destinatario);
+                router.push({ pathname: '/reenviar', params: { mensajeId: menuMensaje.id, canalOrigen: canal } });
+                setMenuMensaje(null);
+              }}
+            >
+              <Text style={styles.menuMensajeOpcionTexto}>Reenviar</Text>
+            </TouchableOpacity>
+            {!!menuMensaje && menuMensaje.mio
+              && Date.now() - menuMensaje.hora <= LIMITE_ELIMINAR_PARA_TODOS_MS && (
+              <TouchableOpacity
+                style={styles.menuMensajeOpcion}
+                accessibilityRole="button"
+                onPress={() => {
+                  if (!menuMensaje) return;
+                  const item = menuMensaje;
+                  setMenuMensaje(null);
+                  confirmarEliminarParaTodos(item);
+                }}
+              >
+                <Text style={[styles.menuMensajeOpcionTexto, styles.menuMensajeOpcionDestructiva]}>
+                  Eliminar para todos
+                </Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity
+              style={[styles.menuMensajeOpcion, styles.menuMensajeOpcionUltima]}
+              accessibilityRole="button"
+              onPress={() => {
+                if (!menuMensaje) return;
+                const item = menuMensaje;
+                setMenuMensaje(null);
+                confirmarBorrarMensaje(item);
+              }}
+            >
+              <Text style={[styles.menuMensajeOpcionTexto, styles.menuMensajeOpcionDestructiva]}>Eliminar para mí</Text>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
 
       <Modal
         visible={!!reaccionandoA}
@@ -1046,10 +1226,12 @@ const styles = StyleSheet.create({
   burbujaTexto: { fontSize: 14, lineHeight: 20 },
   textoPropio: { color: Colors.eli.background },
   textoAjeno: { color: Colors.eli.white },
+  textoEliminado: { fontStyle: 'italic', opacity: 0.7 },
   burbujaMetadata: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', marginTop: 4, gap: 4 },
   burbujaHora: { fontSize: 10, color: Colors.eli.grayLight },
   estadoIcono: { fontSize: 10, color: Colors.eli.grayLight },
   estadoLeido: { color: Colors.eli.primary },
+  estadoError: { color: Colors.eli.error, fontSize: 12 },
   editadoTexto: { fontSize: 10, color: Colors.eli.grayLight, fontStyle: 'italic' },
   citaContenedor: {
     borderLeftWidth: 2, borderLeftColor: Colors.eli.primary,
@@ -1124,6 +1306,7 @@ const styles = StyleSheet.create({
   },
   botonMicActivo: { borderColor: Colors.eli.primary, backgroundColor: '#0D2B2B' },
   botonMicTexto: { fontSize: 18 },
+  botonMicTextoProgreso: { fontSize: 10, fontWeight: '700' },
   botonEnviar: {
     backgroundColor: Colors.eli.primary, borderRadius: 20,
     paddingHorizontal: 16, paddingVertical: 10,
@@ -1147,4 +1330,19 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: Colors.eli.border,
   },
   modalEmojiTexto: { fontSize: 28 },
+  menuMensajeCard: {
+    backgroundColor: Colors.eli.grayDark, borderRadius: 14, width: 240,
+    borderWidth: 1, borderColor: Colors.eli.border, overflow: 'hidden',
+  },
+  menuMensajePreview: {
+    color: Colors.eli.grayLight, fontSize: 12, padding: 14,
+    borderBottomWidth: 1, borderBottomColor: Colors.eli.border,
+  },
+  menuMensajeOpcion: {
+    paddingVertical: 14, paddingHorizontal: 16,
+    borderBottomWidth: 1, borderBottomColor: Colors.eli.border,
+  },
+  menuMensajeOpcionUltima: { borderBottomWidth: 0 },
+  menuMensajeOpcionTexto: { color: Colors.eli.white, fontSize: 15 },
+  menuMensajeOpcionDestructiva: { color: Colors.eli.error },
 });

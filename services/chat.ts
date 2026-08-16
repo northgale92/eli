@@ -1,19 +1,53 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { cifrarMensaje, descifrarMensaje } from './identidad';
-import { nodoConversacion, nodoChat, idCanal, leerClavePublica, publicarClavePublica } from './gun';
+import { nodoConversacion, nodoChat, idCanal, leerClavePublica, publicarClavePublica, putConfirmado } from './gun';
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 
-export type EstadoMensaje = 'enviado' | 'entregado' | 'leido';
+// 'error': la escritura en Gun no se confirmó tras los reintentos de
+// putConfirmado (ver enviarAdjunto) — solo alcanzable para imagen/vídeo/
+// documento por ahora, nunca para texto/audio/ubicación, que siguen siendo
+// fire-and-forget.
+export type EstadoMensaje = 'enviado' | 'entregado' | 'leido' | 'error';
 export type TipoMensaje = 'texto' | 'audio' | 'ubicacion' | 'imagen' | 'video' | 'documento';
 
 // Límites de tamaño para adjuntos: no hay CDN/servidor de medios, todo viaja
 // como base64 dentro de un único campo de un nodo Gun a través del relay
-// P2P — payloads grandes son lentos/poco fiables en ese transporte.
+// P2P — payloads grandes son lentos/poco fiables en ese transporte. El
+// payload final que de verdad viaja por Gun es bastante más pesado que el
+// archivo: cifrarMensaje() cifra el JSON que ya contiene el archivo en
+// base64, y el resultado cifrado se vuelve a codificar en base64 para poder
+// guardarse como string en Gun — overhead real ≈ ×1.78 sobre el archivo
+// (dos pasadas de base64, no una), no solo el ×1.33 de un base64 simple.
 export const LIMITE_IMAGEN_LADO_PX = 1280;
-export const LIMITE_VIDEO_DURACION_S = 30;
-export const LIMITE_VIDEO_BYTES = 8 * 1024 * 1024; // 8MB
+
+// Vídeo: se recodifica en el cliente antes de enviar (ver
+// enviarVideoSeleccionado en app/conversacion.tsx, con react-native-compressor)
+// a un máximo de LIMITE_VIDEO_LADO_PX de lado largo y BITRATE_VIDEO_BPS de
+// bitrate combinado. LIMITE_VIDEO_BYTES se comprueba sobre el archivo YA
+// COMPRIMIDO, no el original — es lo que de verdad se va a enviar. El valor
+// de 12MB da margen sobre el peor caso teórico a ese bitrate para 60s
+// (1.5Mbps × 60s / 8 ≈ 11.25MB), que tras el overhead de doble base64+cifrado
+// arriba descrito ronda ~20MB de payload real por Gun — sin confirmación de
+// cuál es el techo real del relay (no versionado en este repo, vive en el
+// VPS Floki), así que conviene validar en dispositivo real con clips de
+// 30-60s antes de subir esto más.
+export const LIMITE_VIDEO_LADO_PX = 1280;
+export const BITRATE_VIDEO_BPS = 1_500_000;
+export const LIMITE_VIDEO_DURACION_S = 60;
+export const LIMITE_VIDEO_BYTES = 12 * 1024 * 1024; // 12MB, tras compresión
+
 export const LIMITE_DOCUMENTO_BYTES = 5 * 1024 * 1024; // 5MB
+
+// Ventana en la que el AUTOR puede pedir "Eliminar para todos" sobre un
+// mensaje propio. Es una salvaguarda de UX (evita reescribir conversaciones
+// muy antiguas por descuido), NO un límite de seguridad: Gun no autentica
+// quién escribe en un nodo ni firma la hora de sus escrituras, así que nada
+// impide a un cliente modificado enviar el tombstone pasado este plazo — la
+// restricción depende por completo de que la propia UI no ofrezca la opción,
+// igual que el resto de comprobaciones "solo mensajes propios" de este
+// archivo.
+export const LIMITE_ELIMINAR_PARA_TODOS_MS = 60 * 60 * 1000; // 1 hora
 
 export interface RespuestaCitada {
   id: string;
@@ -45,6 +79,7 @@ export interface Mensaje {
   respondeA?: RespuestaCitada;
   editado?: boolean;
   reenviado?: boolean;
+  eliminadoParaTodos?: boolean; // tombstoned vía Gun — ver eliminarMensajeParaTodos
   // tipo === 'audio'
   audioBase64?: string;
   duracionMs?: number;
@@ -456,6 +491,71 @@ export async function editarMensaje(
   return { ok: true };
 }
 
+// Reduce un mensaje a su forma "eliminado para todos": conserva solo los
+// metadatos imprescindibles (quién, para quién, cuándo, de quién era) y
+// descarta texto/adjuntos/citas/reacciones — igual que borra el contenido
+// real un tombstone en Gun, aquí se borra también el rastro que hubiera
+// quedado en la copia local, no solo lo que se muestra en pantalla.
+function tombstonarMensaje(m: Mensaje): Mensaje {
+  return {
+    id: m.id, de: m.de, para: m.para, hora: m.hora, estado: m.estado, mio: m.mio,
+    tipo: 'texto', texto: '', eliminadoParaTodos: true,
+  };
+}
+
+// "Eliminar para todos": tombstona (put null) el nodo del mensaje en Gun para
+// que la eliminación se propague al otro dispositivo por la sincronización
+// normal — mismo patrón que limpiarEstadosPropiosExpirados en
+// services/estados.ts. El otro extremo recibe el nodo puesto a null a través
+// de la misma suscripción de mensajes (suscribirMensajes/
+// procesarMensajeRecibido), que lo traduce a `eliminadoParaTodos: true` en
+// vez de dejarlo desaparecer sin rastro o como un hueco vacío. Si el mensaje
+// ya se había sincronizado al otro dispositivo antes de llamar a esto, el
+// tombstone llega igual por la sincronización normal de Gun y sobrescribe lo
+// ya recibido, porque `.on()` reacciona a cualquier cambio posterior del
+// mismo nodo.
+export async function eliminarMensajeParaTodos(
+  canal: string,
+  mensajeId: string,
+  miId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const mensajes = await cargarMensajesLocal(canal);
+  const idx = mensajes.findIndex(m => m.id === mensajeId);
+  if (idx < 0) return { ok: false, error: 'Mensaje no encontrado.' };
+  if (mensajes[idx].de !== miId) {
+    return { ok: false, error: 'Solo puedes eliminar para todos tus propios mensajes.' };
+  }
+  if (Date.now() - mensajes[idx].hora > LIMITE_ELIMINAR_PARA_TODOS_MS) {
+    return { ok: false, error: 'Ya pasó el tiempo disponible para eliminar este mensaje para todos.' };
+  }
+
+  try {
+    nodoConversacion(canal)?.get(mensajeId).put(null);
+  } catch {
+    // Sin red — el tombstone no sale ahora; se perderá para el otro
+    // dispositivo si esta app nunca vuelve a intentarlo (mismo best-effort
+    // que limpiarEstadosPropiosExpirados en estados.ts).
+  }
+
+  const tombstoneado = tombstonarMensaje(mensajes[idx]);
+  mensajes[idx] = tombstoneado;
+  await guardarMensajesLocal(canal, mensajes);
+
+  const raw = await AsyncStorage.getItem(KEY_CONVS);
+  if (raw) {
+    const lista: Conversacion[] = JSON.parse(raw);
+    const cidx = lista.findIndex(c => c.id === canal);
+    const ultimo = mensajes[mensajes.length - 1];
+    if (cidx >= 0 && ultimo) {
+      lista[cidx].ultimoMensaje = ultimo.eliminadoParaTodos ? 'Este mensaje fue eliminado' : ultimo.texto;
+      lista[cidx].ultimaHora = ultimo.hora;
+      await AsyncStorage.setItem(KEY_CONVS, JSON.stringify(lista));
+    }
+  }
+
+  return { ok: true };
+}
+
 // Envía una nota de voz: el audio (ya grabado) viaja en base64 dentro del
 // mismo sobre cifrado que un mensaje de texto normal — no hay CDN ni blob
 // storage separado en esta app, todo pasa por el mismo canal Gun cifrado.
@@ -538,14 +638,31 @@ export async function enviarUbicacion(
 
 // ─── Adjuntos (imagen / vídeo / documento) ─────────────────────────────────────
 //
-// Mismo pipeline que enviarMensaje/enviarMensajeAudio/enviarUbicacion arriba:
-// el archivo (ya comprimido/redimensionado por la UI antes de llamar aquí)
-// viaja en base64 dentro del mismo sobre cifrado NaCl box, por el mismo canal
-// Gun P2P — no hay CDN ni servidor de medios propio. Deliberadamente NO pasa
-// por moderacionCSAM.ts ni moderacionAdultos.ts: esos módulos solo se aplican
-// al contenido público de Muro/Canales (ver app/nueva-publicacion.tsx); el
-// chat 1:1 es E2E y nadie más que los dos participantes puede ver el archivo,
-// así que no hay nada que un escáner del lado del servidor podría inspeccionar.
+// Mismo pipeline que enviarMensaje/enviarMensajeAudio/enviarUbicacion arriba,
+// con una diferencia deliberada: aquí SÍ se espera confirmación de la
+// escritura (putConfirmado, ver services/gun.ts) en vez de un `.put()`
+// fire-and-forget. Motivo: el archivo (ya comprimido/redimensionado por la
+// UI antes de llamar aquí) viaja en base64 dentro del mismo sobre cifrado
+// NaCl box, por el mismo canal Gun P2P — sin CDN ni servidor de medios
+// propio — y es, con diferencia, el payload más pesado que esta app escribe
+// de forma rutinaria (un vídeo de pocos MB es 20-40x más grande que
+// cualquier mensaje de texto). Gun no reintenta ni avisa si el `.put()` se
+// pierde a mitad de un payload así (ver la nota de cabecera de
+// putConfirmado en gun.ts), así que aquí es donde más falta hace saber de
+// verdad si la escritura llegó, para poder marcar el mensaje con un estado
+// de error real en vez de un check ✓ optimista que miente.
+//
+// Deliberadamente NO pasa por moderacionCSAM.ts ni moderacionAdultos.ts:
+// esos módulos solo se aplican al contenido público de Muro/Canales (ver
+// app/nueva-publicacion.tsx); el chat 1:1 es E2E y nadie más que los dos
+// participantes puede ver el archivo, así que no hay nada que un escáner
+// del lado del servidor podría inspeccionar.
+//
+// `persistido: true` en el resultado distingue un fallo confirmado (la
+// escritura en Gun se intentó y no se confirmó tras los reintentos — el
+// mensaje SÍ se guardó localmente con estado 'error', para que la UI
+// muestre la burbuja) de un fallo previo al intento (p. ej. sin clave
+// pública del destinatario — no se guardó nada, no hay burbuja que mostrar).
 async function enviarAdjunto(
   payload: PayloadMensaje,
   previewTexto: string,
@@ -554,7 +671,7 @@ async function enviarAdjunto(
   miClavePublica: string,
   miClavePrivada: string,
   destinatarioId: string,
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; persistido?: boolean }> {
   const pubDest = await leerClavePublica(destinatarioId);
   if (!pubDest) return { ok: false, error: 'No se encontró la clave pública del destinatario.' };
 
@@ -563,24 +680,31 @@ async function enviarAdjunto(
   const hora = Date.now();
   const canal = idCanal(miId, destinatarioId);
 
-  nodoConversacion(canal).get(id).put({
+  const confirmacion = await putConfirmado(nodoConversacion(canal).get(id), {
     id, cifrado, nonce, de: miId, para: destinatarioId, hora, estado: 'enviado' as EstadoMensaje,
   });
 
+  // Se persiste localmente en ambos casos (éxito o fallo confirmado): el
+  // emisor debe seguir viendo el mensaje que intentó enviar, ahora con el
+  // estado real ('enviado' o 'error') en vez de perderlo silenciosamente.
   const mensaje: Mensaje = {
     id, texto: previewTexto, de: miId, para: destinatarioId, hora,
-    estado: 'enviado', mio: true, ...camposMensaje,
+    estado: confirmacion.ok ? 'enviado' : 'error', mio: true, ...camposMensaje,
   };
   const mensajes = await cargarMensajesLocal(canal);
   mensajes.push(mensaje);
   await guardarMensajesLocal(canal, mensajes);
+
+  if (!confirmacion.ok) {
+    return { ok: false, error: confirmacion.error, persistido: true };
+  }
 
   await actualizarConversacion({
     id: canal, contraparte: destinatarioId, ultimoMensaje: previewTexto, ultimaHora: hora, noLeidos: 0,
   });
   publicarClavePublica(miId, miClavePublica);
 
-  return { ok: true };
+  return { ok: true, persistido: true };
 }
 
 export async function enviarImagen(
@@ -594,7 +718,7 @@ export async function enviarImagen(
   miClavePrivada: string,
   destinatarioId: string,
   reenviado?: boolean,
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; persistido?: boolean }> {
   const payload: PayloadMensaje = {
     tipo: 'imagen', archivo: base64, archivoMime: mime, ancho, alto, archivoTamano: tamanoBytes, reenviado,
   };
@@ -618,7 +742,7 @@ export async function enviarVideo(
   miClavePrivada: string,
   destinatarioId: string,
   reenviado?: boolean,
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; persistido?: boolean }> {
   const payload: PayloadMensaje = {
     tipo: 'video', archivo: base64, archivoMime: mime, miniatura: miniaturaBase64,
     duracionMs, ancho, alto, archivoTamano: tamanoBytes, reenviado,
@@ -643,7 +767,7 @@ export async function enviarDocumento(
   miClavePrivada: string,
   destinatarioId: string,
   reenviado?: boolean,
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; persistido?: boolean }> {
   const payload: PayloadMensaje = {
     tipo: 'documento', archivo: base64, archivoMime: mime, archivoNombre: nombre, archivoTamano: tamanoBytes, reenviado,
   };
@@ -710,6 +834,57 @@ function interpretarPayload(payloadRaw: string): {
   }
 }
 
+// Última versión de cada mensaje ya procesada en este proceso (en memoria,
+// no persistida). Gun reemite el nodo COMPLETO de un mensaje ante cualquier
+// cambio en un campo hermano suyo — típicamente `estado` (marcarLeidos hace
+// un put por cada mensaje no leído al abrir la conversación, y cada uno
+// reactiva este mismo listener vía .map().on()). Sin este atajo,
+// procesarMensajeRecibido descifraba y releía la conversación entera
+// (cargarMensajesLocal recorre AsyncStorage mensaje a mensaje) por cada uno
+// de esos pings de estado, aunque no hubiera nada nuevo que mostrar — con
+// varios mensajes sin leer, o con listeners repetidos si la pantalla se
+// remonta varias veces, esto podía encadenar suficientes lecturas seriadas
+// de AsyncStorage como para bloquear perceptiblemente el hilo JS. Clave:
+// `${canal}:${id}`; se compara cifrado+nonce+editado, que es todo lo que
+// interesa aquí — un `estado` distinto no cambia nada de lo que esta
+// función lee o persiste.
+const cacheEventosProcesados = new Map<string, { cifrado: string; nonce: string; editado: boolean }>();
+
+// Aplica un tombstone recibido (nodo puesto a null vía
+// eliminarMensajeParaTodos, en este mismo dispositivo o en el otro extremo de
+// la conversación): si conocíamos el mensaje localmente, lo reemplaza por su
+// versión "eliminado" en vez de dejarlo desaparecer sin rastro o como un
+// hueco vacío en la lista. Idempotente — Gun puede reemitir el mismo nodo
+// nulo varias veces (reconexión, nueva suscripción al reabrir la
+// conversación), y si el id no lo conocíamos localmente no hay nada que
+// tombstonar.
+async function procesarTombstoneMensaje(
+  canal: string,
+  mensajeId: string,
+  onMensaje: (msg: Mensaje) => void,
+): Promise<void> {
+  if (!mensajeId) return;
+  const mensajes = await cargarMensajesLocal(canal);
+  const idx = mensajes.findIndex(m => m.id === mensajeId);
+  if (idx < 0 || mensajes[idx].eliminadoParaTodos) return;
+
+  const tombstoneado = tombstonarMensaje(mensajes[idx]);
+  mensajes[idx] = tombstoneado;
+  await guardarMensajesLocal(canal, mensajes);
+
+  const raw = await AsyncStorage.getItem(KEY_CONVS);
+  if (raw) {
+    const lista: Conversacion[] = JSON.parse(raw);
+    const cidx = lista.findIndex(c => c.id === canal);
+    if (cidx >= 0 && lista[cidx].ultimaHora === tombstoneado.hora) {
+      lista[cidx].ultimoMensaje = 'Este mensaje fue eliminado';
+      await AsyncStorage.setItem(KEY_CONVS, JSON.stringify(lista));
+    }
+  }
+
+  onMensaje(tombstoneado);
+}
+
 // Procesamiento compartido de un mensaje entrante (nuevo o editado): descifra,
 // persiste localmente e indexa la conversación. Usado tanto por
 // suscribirMensajes (suscripción a UN canal concreto, mientras esa pantalla de
@@ -719,11 +894,27 @@ function interpretarPayload(payloadRaw: string): {
 async function procesarMensajeRecibido(
   canal: string,
   data: any,
+  idNodo: string,
   miId: string,
   miClavePrivada: string,
   onMensaje: (msg: Mensaje) => void,
 ): Promise<void> {
-  if (!data || !data.id || data.para !== miId) return;
+  if (!data) {
+    // Nodo tombstonado (put null) — ver eliminarMensajeParaTodos. Solo
+    // aplicable cuando conocemos el canal, así que suscribirConversacionesEntrantes
+    // (que no lo conoce en este punto, ver más abajo) no pasa por aquí.
+    await procesarTombstoneMensaje(canal, idNodo, onMensaje);
+    return;
+  }
+  if (!data.id || data.para !== miId) return;
+
+  const claveCache = `${canal}:${data.id}`;
+  const editadoActual = !!data.editado;
+  const previo = cacheEventosProcesados.get(claveCache);
+  if (previo && previo.cifrado === data.cifrado && previo.nonce === data.nonce && previo.editado === editadoActual) {
+    return;
+  }
+  cacheEventosProcesados.set(claveCache, { cifrado: data.cifrado, nonce: data.nonce, editado: editadoActual });
 
   const pubRem = await leerClavePublica(data.de);
   if (!pubRem) return;
@@ -735,7 +926,7 @@ async function procesarMensajeRecibido(
     texto, tipo, respondeA, reenviado, audioBase64, duracionMs, lat, lon,
     archivoBase64, archivoMime, archivoNombre, archivoTamano, miniaturaBase64, ancho, alto, preview,
   } = interpretarPayload(payloadRaw);
-  const editado = !!data.editado;
+  const editado = editadoActual;
 
   const mensajes = await cargarMensajesLocal(canal);
   const idx = mensajes.findIndex(m => m.id === data.id);
@@ -784,8 +975,8 @@ export function suscribirMensajes(
   onMensaje: (msg: Mensaje) => void,
 ): () => void {
   const nodo = nodoConversacion(canal);
-  nodo.map().on((data: any) => {
-    procesarMensajeRecibido(canal, data, miId, miClavePrivada, onMensaje).catch(() => {});
+  nodo.map().on((data: any, idNodo: string) => {
+    procesarMensajeRecibido(canal, data, idNodo, miId, miClavePrivada, onMensaje).catch(() => {});
   });
   return () => nodo.map().off();
 }
@@ -815,9 +1006,16 @@ export function suscribirConversacionesEntrantes(
 ): () => void {
   const chat = nodoChat();
   if (!chat) return () => {};
+  // Nota: aquí no se gestionan tombstones (nodo puesto a null) — sin `data.id`
+  // no hay forma de saber a qué canal/mensaje pertenecen (el par de usuarios
+  // no viaja en el nodo nulo), así que esta vía de descubrimiento los ignora
+  // y confía en que suscribirMensajes(canal, ...) los aplique la próxima vez
+  // que se abra esa conversación (Gun reemite el estado conocido del nodo al
+  // volver a suscribirse) — misma limitación ya asumida para "editado" en
+  // este mismo escaneo.
   chat.map().map().on((data: any) => {
     if (!data?.id || !data?.de || data.para !== miId) return;
-    procesarMensajeRecibido(idCanal(data.de, data.para), data, miId, miClavePrivada, onMensaje).catch(() => {});
+    procesarMensajeRecibido(idCanal(data.de, data.para), data, data.id, miId, miClavePrivada, onMensaje).catch(() => {});
   });
   return () => chat.map().map().off();
 }

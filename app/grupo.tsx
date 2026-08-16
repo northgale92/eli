@@ -1,6 +1,7 @@
 import {
   View, Text, StyleSheet, FlatList, TouchableOpacity,
   TextInput, KeyboardAvoidingView, Platform, Alert, Image, ActivityIndicator, Linking,
+  type AlertButton,
 } from 'react-native';
 import { Colors } from '../constants/Colors';
 import { router, useLocalSearchParams } from 'expo-router';
@@ -11,9 +12,11 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   cargarGruposLocal, cargarMensajesGrupoLocal, enviarMensajeGrupo,
-  suscribirMensajesGrupo, marcarGrupoLeido, borrarGrupoLocal,
+  suscribirMensajesGrupo, marcarGrupoLeido, borrarGrupoLocal, borrarMensajeGrupo,
+  eliminarMensajeGrupoParaTodos,
   type MensajeGrupo, type Grupo,
 } from '../services/grupos';
+import { LIMITE_ELIMINAR_PARA_TODOS_MS } from '../services/chat';
 import { obtenerIdentidad } from '../services/identidad';
 
 function formatoHora(ts: number): string {
@@ -33,6 +36,16 @@ function iconoDocumento(mime?: string): string {
   if (mime.includes('word') || mime.includes('document')) return '📝';
   if (mime.includes('sheet') || mime.includes('excel')) return '📊';
   return '📄';
+}
+
+// Inserta por `hora` (timestamp de envío original) en vez de al final: los
+// mensajes recibidos en vivo llegan vía Gun en orden de sincronización P2P,
+// no en orden de envío, así que un simple [...prev, nuevo] los deja
+// desordenados en pantalla (sobre todo con reenvíos, que salen casi juntos).
+function insertarPorHora(lista: MensajeGrupo[], nuevo: MensajeGrupo): MensajeGrupo[] {
+  const pos = lista.findIndex(m => m.hora > nuevo.hora);
+  if (pos === -1) return [...lista, nuevo];
+  return [...lista.slice(0, pos), nuevo, ...lista.slice(pos)];
 }
 
 export default function GrupoChat() {
@@ -70,7 +83,7 @@ export default function GrupoChat() {
         cancelar = suscribirMensajesGrupo(grupoId, id.usuario, id.clavePrivada, (msg) => {
           setMensajes(prev => {
             if (prev.find(m => m.id === msg.id)) return prev;
-            return [...prev, msg];
+            return insertarPorHora(prev, msg);
           });
         });
       }
@@ -99,9 +112,9 @@ export default function GrupoChat() {
 
     const resultado = await enviarMensajeGrupo(textoEnviar, id.usuario, id.clavePrivada, grupoId, grupo.participantes);
     if (resultado.ok) {
-      setMensajes(prev => [...prev, {
+      setMensajes(prev => insertarPorHora(prev, {
         id: `local_${Date.now()}`, texto: textoEnviar, de: id.usuario, hora: Date.now(), mio: true, tipo: 'texto',
-      }]);
+      }));
     } else {
       setTexto(textoEnviar);
     }
@@ -192,10 +205,68 @@ export default function GrupoChat() {
     if (item.tipo === 'documento') { void abrirDocumento(item); return; }
   };
 
-  const renderMensaje = ({ item }: { item: MensajeGrupo }) => (
+  // Como mucho 3 botones (Cancelar + hasta 2 opciones de borrado): cabe sin
+  // problema en el Alert.alert nativo de Android, que solo renderiza como
+  // mucho 3 botones del array que se le pase (ver
+  // node_modules/react-native/Libraries/Alert/Alert.js). "Eliminar para
+  // todos" solo se ofrece sobre mensajes propios y dentro de
+  // LIMITE_ELIMINAR_PARA_TODOS_MS (ver services/chat.ts) — con ambas
+  // opciones presentes, la de solo-local pasa a llamarse "Eliminar para mí"
+  // para diferenciarlas; si solo hay una (mensaje ajeno, o ya fuera de
+  // plazo), conserva el rótulo "Eliminar" de siempre.
+  const confirmarBorrarMensajeGrupo = (item: MensajeGrupo) => {
+    if (!grupoId || item.eliminadoParaTodos) return;
+    const puedeEliminarParaTodos = item.de === miId
+      && Date.now() - item.hora <= LIMITE_ELIMINAR_PARA_TODOS_MS;
+
+    const botones: AlertButton[] = [{ text: 'Cancelar', style: 'cancel' }];
+    if (puedeEliminarParaTodos) {
+      botones.push({
+        text: 'Eliminar para todos',
+        style: 'destructive',
+        onPress: async () => {
+          const resultado = await eliminarMensajeGrupoParaTodos(grupoId, item.id, miId);
+          if (resultado.ok) {
+            setMensajes(prev => prev.map(m => (m.id === item.id ? {
+              id: m.id, de: m.de, hora: m.hora, mio: m.mio, tipo: 'texto', texto: '', eliminadoParaTodos: true,
+            } : m)));
+          } else {
+            Alert.alert('No se pudo eliminar', resultado.error ?? 'Ocurrió un problema al eliminar el mensaje.');
+          }
+        },
+      });
+    }
+    botones.push({
+      text: puedeEliminarParaTodos ? 'Eliminar para mí' : 'Eliminar',
+      style: 'destructive',
+      onPress: async () => {
+        await borrarMensajeGrupo(grupoId, item.id);
+        setMensajes(prev => prev.filter(m => m.id !== item.id));
+      },
+    });
+
+    Alert.alert('Eliminar mensaje', 'Elige una opción.', botones);
+  };
+
+  const renderMensaje = ({ item }: { item: MensajeGrupo }) => {
+    // Igual que en app/conversacion.tsx: un mensaje tombstonado se muestra
+    // como aviso, sin acciones, en vez de desaparecer sin rastro.
+    if (item.eliminadoParaTodos) {
+      return (
+        <View style={[styles.burbuja, item.mio ? styles.burbujaPropia : styles.burbujaAjena]}>
+          {!item.mio && <Text style={styles.remitente}>{item.de}</Text>}
+          <Text style={[styles.burbujaTexto, styles.textoEliminado, item.mio ? styles.textoPropio : styles.textoAjeno]}>
+            🚫 Este mensaje fue eliminado
+          </Text>
+          <Text style={styles.burbujaHora}>{formatoHora(item.hora)}</Text>
+        </View>
+      );
+    }
+    return (
     <TouchableOpacity
       activeOpacity={0.85}
       onPress={() => manejarTapMensaje(item)}
+      onLongPress={() => confirmarBorrarMensajeGrupo(item)}
       style={[styles.burbuja, item.mio ? styles.burbujaPropia : styles.burbujaAjena]}
     >
       {!item.mio && <Text style={styles.remitente}>{item.de}</Text>}
@@ -268,7 +339,8 @@ export default function GrupoChat() {
 
       <Text style={styles.burbujaHora}>{formatoHora(item.hora)}</Text>
     </TouchableOpacity>
-  );
+    );
+  };
 
   return (
     <KeyboardAvoidingView
@@ -392,6 +464,7 @@ const styles = StyleSheet.create({
   burbujaTexto: { fontSize: 14, lineHeight: 20 },
   textoPropio: { color: Colors.eli.background },
   textoAjeno: { color: Colors.eli.white },
+  textoEliminado: { fontStyle: 'italic', opacity: 0.7 },
   burbujaHora: { fontSize: 10, color: Colors.eli.grayLight, textAlign: 'right', marginTop: 4 },
   filaAudio: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   audioIcono: { fontSize: 18, color: Colors.eli.white },
