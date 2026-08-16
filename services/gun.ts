@@ -59,6 +59,21 @@ export function publicarClavePublica(usuarioId: string, clavePublica: string): v
   }
 }
 
+// Usa `.on()` en vez de `.once()`, y solo resuelve cuando ve una clave
+// pública real (no en el primer disparo, sea cual sea su contenido). Motivo:
+// `.once()` puede resolver con el grafo local de Gun todavía vacío para ese
+// nodo si la conexión al relay aún no está lista — típicamente justo tras
+// abrir la app — devolviendo null aunque el peer sí tenga clave publicada.
+// Como esta función se usa para cifrar el envío a CADA destinatario
+// (enviarContenidoGrupo, publicarPayload/Estados, enviarAdjunto en chat.ts),
+// un null prematuro no es un error visible: el remitente simplemente omite
+// el `para_<destinatario>` de ese envío y el contenido nunca llega para él,
+// sin ningún aviso — sospecha fundada de por qué un Estado con foto (payload
+// más pesado, más tiempo hasta que el emisor complete el fan-out) puede
+// perderse para un contacto mientras un Estado de texto, publicado con la
+// conexión ya caliente, sí llega. Con `.on()`, si la clave real llega más
+// tarde (peer recién conectado), el callback se dispara de nuevo con el
+// dato correcto en vez de quedarse resuelto en null para siempre.
 export function leerClavePublica(usuarioId: string): Promise<string | null> {
   return new Promise((resolve) => {
     try {
@@ -67,10 +82,20 @@ export function leerClavePublica(usuarioId: string): Promise<string | null> {
         resolve(null);
         return;
       }
-      const timeout = setTimeout(() => resolve(null), 8000);
-      nodo.get(usuarioId).once((data: any) => {
+      let resuelto = false;
+      const ref = nodo.get(usuarioId);
+      const timeout = setTimeout(() => {
+        if (resuelto) return;
+        resuelto = true;
+        ref.off();
+        resolve(null);
+      }, 8000);
+      ref.on((data: any) => {
+        if (resuelto || !data?.clavePublica) return;
+        resuelto = true;
         clearTimeout(timeout);
-        resolve(data?.clavePublica ?? null);
+        ref.off();
+        resolve(data.clavePublica);
       });
     } catch {
       resolve(null);
@@ -128,6 +153,106 @@ export function leerPerfil(usuarioId: string): Promise<PerfilPublico | null> {
     } catch {
       resolve(null);
     }
+  });
+}
+
+// Igual que leerPerfil, pero con suscripción en vivo (`.on()`) en vez de una
+// única lectura (`.once()`). Motivo: justo al arrancar la app, `.once()`
+// puede resolver antes de que la conexión al relay esté lista — con el grafo
+// local de Gun todavía vacío para ese nodo — y entonces devuelve null/datos
+// desactualizados para siempre, porque leerPerfil no vuelve a consultarse
+// una vez resuelta esa promesa (ver el "caché" de perfilesContactos en
+// app/(tabs)/chat.tsx). Con `.on()`, en cambio, si la respuesta real llega
+// más tarde (cuando el peer se conecta), el callback se vuelve a disparar
+// con el dato correcto y la UI se autocorrige sin necesitar reiniciar la app.
+export function suscribirPerfil(
+  usuarioId: string,
+  onPerfil: (perfil: PerfilPublico) => void,
+): () => void {
+  const nodo = nodoUsuarios();
+  if (!nodo) return () => {};
+  const ref = nodo.get(usuarioId);
+  ref.on((data: any) => {
+    if (!data) return;
+    onPerfil({
+      clavePublica: data.clavePublica ?? null,
+      nombreVisible: data.nombreVisible || undefined,
+      fotoPerfil: data.fotoPerfil || undefined,
+    });
+  });
+  return () => ref.off();
+}
+
+// ─── Escritura confirmada (ack + reintento) ──────────────────────────────────
+//
+// gun.put() es "fire-and-forget" por defecto: no hay ninguna garantía de que
+// el dato llegara siquiera a intentarse enviar al peer, y mucho menos de que
+// el peer lo aceptara. En node_modules/gun/gun.js, el camino de salida traga
+// los errores en silencio en dos puntos: json(msg, res) -> res(err, raw){
+// if(err){ return } // TODO: Handle!! } y send(raw, peer){ try{
+// wire.send(raw) }catch(e){ peer.queue.push(raw) } } — si falla la
+// serialización o el wire.send() (p. ej. el WebSocket se cae a mitad de un
+// payload grande), el mensaje se pierde sin que ninguna función que llamó a
+// `.put()` se entere. Esto es especialmente peligroso para payloads pesados
+// (adjuntos de chat, Estados con foto/vídeo) donde una desconexión a mitad
+// de envío es mucho más probable que con un mensaje de texto pequeño.
+//
+// putConfirmado usa el callback de ack nativo de Gun (`ref.put(datos, cb)`)
+// para saber si la escritura se confirmó, con un timeout propio (Gun no
+// garantiza que el ack llegue si el wire se cae) y varios reintentos con
+// backoff antes de darse por vencido.
+export interface OpcionesEscrituraConfirmada {
+  intentos?: number;   // total de intentos, incluido el primero (por defecto 3)
+  timeoutMs?: number;  // por intento, esperando el ack (por defecto 6000)
+  backoffMs?: number;  // espera antes de reintentar, ×intento (por defecto 500)
+}
+
+export function putConfirmado(
+  ref: any,
+  datos: unknown,
+  opciones: OpcionesEscrituraConfirmada = {},
+): Promise<{ ok: boolean; error?: string }> {
+  const intentosTotal = opciones.intentos ?? 3;
+  const timeoutMs = opciones.timeoutMs ?? 6000;
+  const backoffMs = opciones.backoffMs ?? 500;
+
+  return new Promise((resolve) => {
+    let intento = 0;
+
+    function intentar() {
+      intento++;
+      let resuelto = false;
+      let temporizador: ReturnType<typeof setTimeout>;
+
+      const terminarIntento = (resultado: { ok: boolean; error?: string }) => {
+        if (resuelto) return;
+        resuelto = true;
+        clearTimeout(temporizador);
+        if (resultado.ok || intento >= intentosTotal) {
+          resolve(resultado);
+          return;
+        }
+        setTimeout(intentar, backoffMs * intento);
+      };
+
+      temporizador = setTimeout(() => {
+        terminarIntento({ ok: false, error: 'timeout esperando confirmación de Gun' });
+      }, timeoutMs);
+
+      try {
+        ref.put(datos, (ack: any) => {
+          if (ack && ack.err) {
+            terminarIntento({ ok: false, error: String(ack.err) });
+          } else {
+            terminarIntento({ ok: true });
+          }
+        });
+      } catch (err) {
+        terminarIntento({ ok: false, error: err instanceof Error ? err.message : 'excepción al escribir en Gun' });
+      }
+    }
+
+    intentar();
   });
 }
 

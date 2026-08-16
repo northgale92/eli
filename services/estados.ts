@@ -1,6 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { cifrarMensaje, descifrarMensaje } from './identidad';
-import { nodoEstados, leerClavePublica } from './gun';
+import { nodoEstados, leerClavePublica, putConfirmado } from './gun';
 import { cargarConversaciones } from './chat';
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -160,13 +160,19 @@ export async function limpiarEstadosPropiosExpirados(miId: string): Promise<void
 
 // ─── Publicación ──────────────────────────────────────────────────────────────
 
+// Igual que enviarAdjunto en services/chat.ts: se espera confirmación real
+// de la escritura (putConfirmado) en vez de un `.put()` fire-and-forget.
+// Un estado con foto/vídeo es, si acaso, un payload TODAVÍA más pesado que
+// un adjunto de chat 1:1 (lleva un sobre cifrado por cada contacto en el
+// mismo nodo — ver nota de cabecera del archivo), así que corre el mismo
+// riesgo de perderse en silencio si el wire se cae a mitad de envío.
 async function publicarPayload(
   payload: PayloadEstado,
   camposEstado: Partial<Estado>,
   miId: string,
   miClavePrivada: string,
   contactos: string[],
-): Promise<{ ok: boolean }> {
+): Promise<{ ok: boolean; error?: string }> {
   const id = `${miId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const creadoEn = Date.now();
   const contenido = JSON.stringify(payload);
@@ -178,7 +184,11 @@ async function publicarPayload(
     const { cifrado, nonce } = cifrarMensaje(contenido, pub, miClavePrivada);
     campos[`para_${contacto}`] = JSON.stringify({ cifrado, nonce });
   }
-  nodoEstados().get(miId).get(id).put(campos);
+
+  const confirmacion = await putConfirmado(nodoEstados().get(miId).get(id), campos);
+  if (!confirmacion.ok) {
+    return { ok: false, error: confirmacion.error };
+  }
 
   const estado: Estado = { id, autor: miId, creadoEn, tipo: payload.tipo, vistoPor: [], ...camposEstado };
   const propios = await cargarEstadosPropiosRaw();
@@ -194,7 +204,7 @@ export async function publicarEstadoTexto(
   miId: string,
   miClavePrivada: string,
   contactos: string[],
-): Promise<{ ok: boolean }> {
+): Promise<{ ok: boolean; error?: string }> {
   return publicarPayload(
     { tipo: 'texto', texto, colorFondo },
     { texto, colorFondo },
@@ -212,7 +222,7 @@ export async function publicarEstadoImagen(
   miId: string,
   miClavePrivada: string,
   contactos: string[],
-): Promise<{ ok: boolean }> {
+): Promise<{ ok: boolean; error?: string }> {
   return publicarPayload(
     { tipo: 'imagen', archivo: base64, archivoMime: mime, texto: textoSuperpuesto },
     { archivoBase64: base64, archivoMime: mime, texto: textoSuperpuesto },
@@ -228,7 +238,7 @@ export async function publicarEstadoVideo(
   miId: string,
   miClavePrivada: string,
   contactos: string[],
-): Promise<{ ok: boolean }> {
+): Promise<{ ok: boolean; error?: string }> {
   return publicarPayload(
     { tipo: 'video', archivo: base64, archivoMime: mime, duracionMs, texto: textoSuperpuesto },
     { archivoBase64: base64, archivoMime: mime, duracionMs, texto: textoSuperpuesto },
