@@ -31,6 +31,7 @@
       "expo-router",
       "react-native-fast-tflite",
       "./plugins/withSaveInstanceStateFix.js",
+      "./plugins/withAllowBackupFix.js",
       [
         "expo-splash-screen",
         {
