@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ELI — Private communication, no middlemen</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; }
+  body {
+    font-family: 'Helvetica Neue', Arial, sans-serif;
+    background:
+      radial-gradient(120% 90% at 30% 20%, #0d2e1a 0%, transparent 55%),
+      radial-gradient(100% 80% at 80% 85%, #0a1f14 0%, transparent 60%),
+      linear-gradient(160deg, #060706 0%, #0a1210 35%, #0f1f16 60%, #060706 100%);
+    min-height:100vh;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:flex-start;
+    position:relative;
+    padding: 64px 20px 80px;
+  }
+  .blob {
+    position:fixed;
+    border-radius:50%;
+    filter: blur(70px);
+    opacity:0.35;
+    mix-blend-mode: screen;
+    pointer-events:none;
+  }
+  .b1 { width:520px; height:520px; background:radial-gradient(circle, #1fae6f, transparent 70%); top:-180px; left:-160px; }
+  .b2 { width:420px; height:420px; background:radial-gradient(circle, #0a3d24, transparent 70%); bottom:-160px; right:-140px; }
+  .b3 { width:300px; height:300px; background:radial-gradient(circle, #3fe08a, transparent 70%); top:40%; right:10%; opacity:0.18; }
+
+  .logo {
+    color:#e9fff2;
+    font-size:15px;
+    letter-spacing:8px;
+    font-weight:300;
+    margin-bottom:48px;
+    z-index:2;
+    opacity:0.85;
+  }
+
+  .lang-switch {
+    position:fixed;
+    top:20px;
+    right:20px;
+    z-index:10;
+    display:flex;
+    gap:4px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius:10px;
+    padding:4px;
+    backdrop-filter: blur(10px);
+  }
+  .lang-btn {
+    background:transparent;
+    border:none;
+    color:#9fd9bb;
+    font-size:12px;
+    font-weight:600;
+    letter-spacing:0.5px;
+    padding:6px 12px;
+    border-radius:7px;
+    cursor:pointer;
+    font-family: inherit;
+  }
+  .lang-btn.active {
+    background: rgba(63,224,138,0.2);
+    color:#f2fff8;
+  }
+
+  /* ---------- HERO: cuenta atrás ---------- */
+  .glass {
+    position:relative;
+    z-index:2;
+    width:min(560px, 92vw);
+    padding:56px 40px 48px;
+    border-radius:32px;
+    background: linear-gradient(135deg, rgba(255,255,255,0.14), rgba(255,255,255,0.02) 40%, rgba(20,60,40,0.10) 100%);
+    backdrop-filter: blur(22px) saturate(140%);
+    -webkit-backdrop-filter: blur(22px) saturate(140%);
+    border: 1px solid rgba(255,255,255,0.18);
+    box-shadow:
+      0 30px 60px rgba(0,0,0,0.55),
+      inset 0 1px 1px rgba(255,255,255,0.35),
+      inset 0 -20px 40px rgba(0,0,0,0.25);
+    text-align:center;
+    overflow:hidden;
+    margin-bottom:28px;
+    flex-shrink:0;
+  }
+  .glass::before {
+    content:"";
+    position:absolute;
+    top:-60%; left:-30%;
+    width:70%; height:220%;
+    background: linear-gradient(115deg, rgba(255,255,255,0.35), rgba(255,255,255,0) 45%);
+    transform: rotate(12deg);
+    pointer-events:none;
+  }
+  .glass::after {
+    content:"";
+    position:absolute;
+    bottom:-8px; right:-8px;
+    width:180px; height:180px;
+    background: radial-gradient(circle, rgba(40,230,130,0.25), transparent 70%);
+    filter: blur(20px);
+  }
+
+  .eyebrow {
+    color:#8ff0bb;
+    font-size:12px;
+    letter-spacing:4px;
+    font-weight:500;
+    margin-bottom:18px;
+    position:relative; z-index:3;
+  }
+  h1 {
+    color:#f4fff9;
+    font-size:26px;
+    font-weight:300;
+    line-height:1.5;
+    margin-bottom:40px;
+    position:relative; z-index:3;
+  }
+  .clock {
+    display:flex;
+    justify-content:center;
+    gap:18px;
+    position:relative; z-index:3;
+    flex-wrap: wrap;
+  }
+  .unit {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius:16px;
+    padding:16px 14px;
+    min-width:72px;
+    backdrop-filter: blur(6px);
+  }
+  .num {
+    font-size:34px;
+    font-weight:600;
+    color:#eafff4;
+    font-variant-numeric: tabular-nums;
+  }
+  .label {
+    font-size:10px;
+    letter-spacing:2px;
+    color:#9fd9bb;
+    margin-top:6px;
+    text-transform:uppercase;
+  }
+  .foot {
+    margin-top:32px;
+    font-size:12px;
+    color:#7fae94;
+    letter-spacing:1px;
+    position:relative; z-index:3;
+  }
+
+  /* ---------- PESTAÑAS ---------- */
+  .tabs-wrap {
+    position:relative;
+    z-index:2;
+    width:min(560px, 92vw);
+    flex-shrink:0;
+  }
+  .tabbar {
+    display:flex;
+    gap:6px;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius:14px;
+    padding:5px;
+    margin-bottom:16px;
+    backdrop-filter: blur(10px);
+  }
+  .tabbtn {
+    flex:1;
+    background:transparent;
+    border:none;
+    color:#9fd9bb;
+    font-size:13px;
+    letter-spacing:0.5px;
+    font-weight:500;
+    padding:12px 10px;
+    border-radius:10px;
+    cursor:pointer;
+    transition: background .2s ease, color .2s ease;
+    font-family: inherit;
+  }
+  .tabbtn.active {
+    background: linear-gradient(135deg, rgba(63,224,138,0.22), rgba(31,174,111,0.10));
+    color:#f2fff8;
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.25);
+  }
+
+  .panel {
+    display:none;
+    background: linear-gradient(135deg, rgba(255,255,255,0.09), rgba(255,255,255,0.015) 40%, rgba(20,60,40,0.08) 100%);
+    backdrop-filter: blur(18px) saturate(130%);
+    -webkit-backdrop-filter: blur(18px) saturate(130%);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius:24px;
+    padding:32px 30px;
+    box-shadow: 0 20px 40px rgba(0,0,0,0.45), inset 0 1px 1px rgba(255,255,255,0.2);
+  }
+  .panel.active { display:block; }
+
+  .panel h2 {
+    color:#eafff4;
+    font-size:15px;
+    font-weight:500;
+    letter-spacing:1px;
+    margin-bottom:14px;
+  }
+  .panel p {
+    color:#c9e9d8;
+    font-size:14px;
+    line-height:1.75;
+    margin-bottom:14px;
+  }
+  .panel p:last-of-type { margin-bottom:0; }
+
+  .divider {
+    border:none;
+    border-top:1px solid rgba(255,255,255,0.1);
+    margin:22px 0;
+  }
+
+  .linkrow {
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+  }
+  .linkbtn {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius:12px;
+    padding:14px 18px;
+    color:#eafff4;
+    text-decoration:none;
+    font-size:13px;
+    letter-spacing:0.3px;
+    transition: background .2s ease, border-color .2s ease;
+  }
+  .linkbtn:hover {
+    background: rgba(255,255,255,0.09);
+    border-color: rgba(255,255,255,0.24);
+  }
+  .linkbtn .arrow { color:#8ff0bb; font-size:15px; }
+
+  /* Descarga */
+  .download-hero {
+    text-align:center;
+    padding: 6px 0 22px;
+  }
+  .download-hero .badge {
+    display:inline-block;
+    font-size:11px;
+    letter-spacing:2px;
+    color:#8ff0bb;
+    background: rgba(63,224,138,0.12);
+    border: 1px solid rgba(63,224,138,0.28);
+    padding:6px 14px;
+    border-radius:999px;
+    margin-bottom:16px;
+  }
+  .download-btn {
+    display:block;
+    width:100%;
+    text-align:center;
+    background: linear-gradient(135deg, #3fe08a, #1fae6f);
+    color:#04140c;
+    font-weight:600;
+    font-size:15px;
+    letter-spacing:0.4px;
+    padding:16px;
+    border-radius:14px;
+    text-decoration:none;
+    box-shadow: 0 14px 30px rgba(63,224,138,0.25);
+    transition: transform .15s ease, box-shadow .15s ease;
+  }
+  .download-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 18px 36px rgba(63,224,138,0.32);
+  }
+  .download-meta {
+    margin-top:14px;
+    font-size:12px;
+    color:#7fae94;
+    letter-spacing:0.3px;
+  }
+  .steps {
+    margin-top:26px;
+    display:flex;
+    flex-direction:column;
+    gap:12px;
+  }
+  .step {
+    display:flex;
+    gap:12px;
+    align-items:flex-start;
+  }
+  .step .n {
+    flex:none;
+    width:22px; height:22px;
+    border-radius:50%;
+    background: rgba(63,224,138,0.15);
+    border:1px solid rgba(63,224,138,0.3);
+    color:#8ff0bb;
+    font-size:11px;
+    font-weight:600;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .step p { margin:0; font-size:13px; color:#bfe0d0; line-height:1.6; }
+
+  [data-lang-content] { display:none; }
+  [data-lang-content].active { display:block; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .linkbtn, .download-btn, .tabbtn { transition:none; }
+  }
+
+  .tabbtn:focus-visible,
+  .linkbtn:focus-visible,
+  .download-btn:focus-visible,
+  .lang-btn:focus-visible {
+    outline: 2px solid #8ff0bb;
+    outline-offset: 2px;
+  }
+</style>
+</head>
+<body>
+  <div class="lang-switch">
+    <button class="lang-btn active" data-lang="en">EN</button>
+    <button class="lang-btn" data-lang="es">ES</button>
+  </div>
+
+  <div class="blob b1"></div>
+  <div class="blob b2"></div>
+  <div class="blob b3"></div>
+
+  <div class="logo">E L I</div>
+
+  <div class="glass">
+    <div class="eyebrow" data-lang-content="en">TIME LIMIT</div>
+    <div class="eyebrow" data-lang-content="es">TIEMPO LÍMITE</div>
+    <h1 id="hero-title">You have 265 days to download it.<br>When the clock hits zero, it self-destructs.</h1>
+    <div class="clock">
+      <div class="unit"><div class="num" id="d">00</div><div class="label" data-lang-content="en">days</div><div class="label" data-lang-content="es">días</div></div>
+      <div class="unit"><div class="num" id="h">00</div><div class="label" data-lang-content="en">hrs</div><div class="label" data-lang-content="es">hor</div></div>
+      <div class="unit"><div class="num" id="m">00</div><div class="label" data-lang-content="en">min</div><div class="label" data-lang-content="es">min</div></div>
+      <div class="unit"><div class="num" id="s">00</div><div class="label" data-lang-content="en">sec</div><div class="label" data-lang-content="es">seg</div></div>
+    </div>
+    <div class="foot" data-lang-content="en">Self-destruction scheduled</div>
+    <div class="foot" data-lang-content="es">Autodestrucción programada</div>
+  </div>
+
+  <div class="tabs-wrap">
+    <div class="tabbar" role="tablist">
+      <button class="tabbtn active" role="tab" aria-selected="true" data-tab="info">
+        <span data-lang-content="en">Manifesto & README</span>
+        <span data-lang-content="es">Manifiesto y README</span>
+      </button>
+      <button class="tabbtn" role="tab" aria-selected="false" data-tab="download">
+        <span data-lang-content="en">Download</span>
+        <span data-lang-content="es">Descarga</span>
+      </button>
+    </div>
+
+    <!-- PANEL 1: Manifesto + README -->
+    <div class="panel active" id="panel-info" role="tabpanel">
+      <div data-lang-content="en">
+        <h2>MANIFESTO</h2>
+        <p>ELI was born from the conviction that a free, private, and supportive internet is still possible. There's no advertising tracking what you say. There's no central server where a company can read your conversations, sell them, or hand them over under pressure. End-to-end encryption isn't a marketing promise — it's an architectural decision that not even whoever runs the infrastructure can bypass.</p>
+        <p>The code is yours. Not figuratively: literally no company owns this, no shareholders are waiting for a return. ELI belongs to the community, from day one and forever.</p>
+        <hr class="divider">
+        <h2>FULL DOCUMENTATION</h2>
+        <div class="linkrow">
+          <a class="linkbtn" href="https://github.com/northgale92/eli/blob/main/README.md" target="_blank" rel="noopener"><span>README — full architecture and philosophy</span><span class="arrow">↗</span></a>
+          <a class="linkbtn" href="https://github.com/northgale92/eli/blob/main/MANIFIESTO.docx" target="_blank" rel="noopener"><span>Full manifesto (EN/ES)</span><span class="arrow">↗</span></a>
+          <a class="linkbtn" href="https://github.com/northgale92/eli/blob/main/SECURITY.md" target="_blank" rel="noopener"><span>Limitations and security, documented openly</span><span class="arrow">↗</span></a>
+          <a class="linkbtn" href="https://github.com/northgale92/eli" target="_blank" rel="noopener"><span>Full source code (AGPLv3)</span><span class="arrow">↗</span></a>
+        </div>
+      </div>
+      <div data-lang-content="es">
+        <h2>MANIFIESTO</h2>
+        <p>ELI nació de la convicción de que un internet libre, privado y solidario todavía es posible. No hay publicidad que rastree lo que dices. No hay servidor central donde una empresa pueda leer tus conversaciones, venderlas, o entregarlas bajo presión. El cifrado de extremo a extremo no es una promesa de marketing — es una decisión de arquitectura que ni siquiera quien mantiene la infraestructura puede saltarse.</p>
+        <p>El código es vuestro. No en sentido figurado: literalmente no hay empresa dueña de esto, no hay accionistas esperando un retorno. ELI es de la comunidad, desde el primer día y para siempre.</p>
+        <hr class="divider">
+        <h2>DOCUMENTACIÓN COMPLETA</h2>
+        <div class="linkrow">
+          <a class="linkbtn" href="https://github.com/northgale92/eli/blob/main/README.md" target="_blank" rel="noopener"><span>README — arquitectura y filosofía completa</span><span class="arrow">↗</span></a>
+          <a class="linkbtn" href="https://github.com/northgale92/eli/blob/main/MANIFIESTO.docx" target="_blank" rel="noopener"><span>Manifiesto completo (ES/EN)</span><span class="arrow">↗</span></a>
+          <a class="linkbtn" href="https://github.com/northgale92/eli/blob/main/SECURITY.md" target="_blank" rel="noopener"><span>Límites y seguridad, documentados sin filtros</span><span class="arrow">↗</span></a>
+          <a class="linkbtn" href="https://github.com/northgale92/eli" target="_blank" rel="noopener"><span>Código fuente completo (AGPLv3)</span><span class="arrow">↗</span></a>
+        </div>
+      </div>
+    </div>
+
+    <!-- PANEL 2: Download -->
+    <div class="panel" id="panel-download" role="tabpanel">
+      <div class="download-hero">
+        <span class="badge">APK · NO GOOGLE PLAY</span>
+        <!-- Replace href below with the real APK link once uploaded -->
+        <a class="download-btn" href="#" id="apk-link">
+          <span data-lang-content="en">Download ELI</span>
+          <span data-lang-content="es">Descargar ELI</span>
+        </a>
+        <div class="download-meta" data-lang-content="en">Direct install · no phone or email required</div>
+        <div class="download-meta" data-lang-content="es">Instalación directa · sin teléfono ni email requeridos</div>
+      </div>
+      <div class="steps">
+        <div class="step">
+          <div class="n">1</div>
+          <p data-lang-content="en">Download the APK file from this site.</p>
+          <p data-lang-content="es">Descarga el archivo APK desde este mismo sitio.</p>
+        </div>
+        <div class="step">
+          <div class="n">2</div>
+          <p data-lang-content="en">Android will ask permission to install apps from unknown sources — normal since it's not from Google Play.</p>
+          <p data-lang-content="es">Android te pedirá permiso para instalar apps de fuentes desconocidas — es normal al no venir de Google Play.</p>
+        </div>
+        <div class="step">
+          <div class="n">3</div>
+          <p data-lang-content="en">Open the app, generate your cryptographic key on-device, and you're in. No phone numbers, no emails.</p>
+          <p data-lang-content="es">Abre la app, genera tu clave criptográfica en el propio dispositivo y ya estás dentro. Nada de números de teléfono ni correos.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  // ---- Countdown / Cuenta atrás ----
+  // Domain self-destruct timer for eli-app.org (365 days from activation ~May 9 2026).
+  // 265 days remain as of Aug 16 2026 → target: May 8 2027.
+  const target = new Date("2027-05-08T00:00:00");
+
+  function tick(){
+    const now = new Date();
+    let diff = Math.max(0, target - now);
+    const d = Math.floor(diff/86400000); diff -= d*86400000;
+    const h = Math.floor(diff/3600000); diff -= h*3600000;
+    const m = Math.floor(diff/60000); diff -= m*60000;
+    const s = Math.floor(diff/1000);
+    document.getElementById('d').textContent = String(d).padStart(2,'0');
+    document.getElementById('h').textContent = String(h).padStart(2,'0');
+    document.getElementById('m').textContent = String(m).padStart(2,'0');
+    document.getElementById('s').textContent = String(s).padStart(2,'0');
+  }
+  tick(); setInterval(tick, 1000);
+
+  // ---- Tabs ----
+  const tabs = document.querySelectorAll('.tabbtn');
+  const panels = { info: document.getElementById('panel-info'), download: document.getElementById('panel-download') };
+  tabs.forEach(btn => {
+    btn.addEventListener('click', () => {
+      tabs.forEach(b => { b.classList.remove('active'); b.setAttribute('aria-selected','false'); });
+      Object.values(panels).forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      btn.setAttribute('aria-selected','true');
+      panels[btn.dataset.tab].classList.add('active');
+    });
+  });
+
+  // ---- Language switch ----
+  const heroTitles = {
+    en: "You have 265 days to download it.<br>When the clock hits zero, it self-destructs.",
+    es: "Tenéis 265 días para descargarla.<br>Cuando el reloj llegue a cero, se autodestruirá."
+  };
+  const langBtns = document.querySelectorAll('.lang-btn');
+  function setLang(lang){
+    document.documentElement.lang = lang;
+    langBtns.forEach(b => b.classList.toggle('active', b.dataset.lang === lang));
+    document.querySelectorAll('[data-lang-content]').forEach(el => {
+      el.classList.toggle('active', el.getAttribute('data-lang-content') === lang);
+    });
+    document.getElementById('hero-title').innerHTML = heroTitles[lang];
+  }
+  langBtns.forEach(b => b.addEventListener('click', () => setLang(b.dataset.lang)));
+  setLang('en');
+</script>
+</body>
+</html>
